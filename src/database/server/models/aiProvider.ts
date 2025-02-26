@@ -1,5 +1,7 @@
 import { and, asc, desc, eq } from 'drizzle-orm/expressions';
+import { isEmpty } from 'lodash-es';
 
+import { DEFAULT_MODEL_PROVIDER_LIST } from '@/config/modelProviders';
 import { LobeChatDatabase } from '@/database/type';
 import { ModelProvider } from '@/libs/agent-runtime';
 import {
@@ -9,6 +11,7 @@ import {
   CreateAiProviderParams,
   UpdateAiProviderConfigParams,
 } from '@/types/aiProvider';
+import { merge } from '@/utils/merge';
 
 import { AiProviderSelectItem, aiModels, aiProviders } from '../../schemas';
 
@@ -114,21 +117,34 @@ export class AiProviderModel {
     const encrypt = encryptor ?? defaultSerialize;
     const keyVaults = await encrypt(JSON.stringify(value.keyVaults));
 
+    const commonFields = {
+      checkModel: value.checkModel,
+      fetchOnClient: value.fetchOnClient,
+      keyVaults,
+    };
+
     return this.db
-      .update(aiProviders)
-      .set({ ...value, keyVaults, updatedAt: new Date() })
-      .where(and(eq(aiProviders.id, id), eq(aiProviders.userId, this.userId)));
+      .insert(aiProviders)
+      .values({
+        ...commonFields,
+        id,
+        source: this.getProviderSource(id),
+        updatedAt: new Date(),
+        userId: this.userId,
+      })
+      .onConflictDoUpdate({
+        set: { ...commonFields, updatedAt: new Date() },
+        target: [aiProviders.id, aiProviders.userId],
+      });
   };
 
   toggleProviderEnabled = async (id: string, enabled: boolean) => {
-    const isBuiltin = Object.values(ModelProvider).includes(id as any);
-
     return this.db
       .insert(aiProviders)
       .values({
         enabled,
         id,
-        source: isBuiltin ? 'builtin' : 'custom',
+        source: this.getProviderSource(id),
         updatedAt: new Date(),
         userId: this.userId,
       })
@@ -141,15 +157,13 @@ export class AiProviderModel {
   updateOrder = async (sortMap: { id: string; sort: number }[]) => {
     await this.db.transaction(async (tx) => {
       const updates = sortMap.map(({ id, sort }) => {
-        const isBuiltin = Object.values(ModelProvider).includes(id as any);
-
         return tx
           .insert(aiProviders)
           .values({
             enabled: true,
             id,
             sort,
-            source: isBuiltin ? 'builtin' : 'custom',
+            source: this.getProviderSource(id),
             updatedAt: new Date(),
             userId: this.userId,
           })
@@ -165,11 +179,12 @@ export class AiProviderModel {
 
   getAiProviderById = async (
     id: string,
-    decryptor: DecryptUserKeyVaults,
+    decryptor?: DecryptUserKeyVaults,
   ): Promise<AiProviderDetailItem | undefined> => {
     const query = this.db
       .select({
         checkModel: aiProviders.checkModel,
+        description: aiProviders.description,
         enabled: aiProviders.enabled,
         fetchOnClient: aiProviders.fetchOnClient,
         id: aiProviders.id,
@@ -202,10 +217,15 @@ export class AiProviderModel {
 
     const keyVaults = !!result.keyVaults ? await decrypt(result.keyVaults) : {};
 
-    return { ...result, keyVaults } as AiProviderDetailItem;
+    return {
+      ...result,
+      fetchOnClient: typeof result.fetchOnClient === 'boolean' ? result.fetchOnClient : undefined,
+      keyVaults,
+      settings: isEmpty(result.settings) ? undefined : result.settings,
+    } as AiProviderDetailItem;
   };
 
-  getAiProviderRuntimeConfig = async (decryptor: DecryptUserKeyVaults) => {
+  getAiProviderRuntimeConfig = async (decryptor?: DecryptUserKeyVaults) => {
     const result = await this.db
       .select({
         fetchOnClient: aiProviders.fetchOnClient,
@@ -220,10 +240,13 @@ export class AiProviderModel {
     let runtimeConfig: Record<string, AiProviderRuntimeConfig> = {};
 
     for (const item of result) {
+      const builtin = DEFAULT_MODEL_PROVIDER_LIST.find((provider) => provider.id === item.id);
+
+      const userSettings = item.settings || {};
       runtimeConfig[item.id] = {
         fetchOnClient: typeof item.fetchOnClient === 'boolean' ? item.fetchOnClient : undefined,
         keyVaults: !!item.keyVaults ? await decrypt(item.keyVaults) : {},
-        settings: item.settings || {},
+        settings: !!builtin ? merge(builtin.settings, userSettings) : userSettings,
       };
     }
 
@@ -231,4 +254,6 @@ export class AiProviderModel {
   };
 
   private isBuiltInProvider = (id: string) => Object.values(ModelProvider).includes(id as any);
+
+  private getProviderSource = (id: string) => (this.isBuiltInProvider(id) ? 'builtin' : 'custom');
 }
